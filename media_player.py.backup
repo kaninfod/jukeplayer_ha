@@ -1,0 +1,1105 @@
+"""Jukebox media player integration."""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+from datetime import datetime
+import json
+import logging
+import ssl
+from typing import Any
+
+import aiohttp
+
+from homeassistant.components.media_player import (
+    BrowseMedia,
+    MediaClass,
+    MediaPlayerDeviceClass,
+    MediaPlayerEntity,
+    MediaPlayerEntityFeature,
+    MediaPlayerState,
+    MediaType,
+)
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_USERNAME
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.util.dt import utcnow
+
+from . import JukeboxConfigEntry
+
+_LOGGER = logging.getLogger(__name__)
+
+# Configuration constants
+CONF_USE_SSL = "use_ssl"
+CONF_PORT = "port"
+
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: JukeboxConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    """Set up Jukebox media player from a config entry."""
+    host = entry.data[CONF_HOST]
+    username = entry.data[CONF_USERNAME]
+    password = entry.data[CONF_PASSWORD]
+    use_ssl = entry.data.get(CONF_USE_SSL, True)
+    port = entry.data.get(CONF_PORT, 443 if use_ssl else 80)
+
+    # Create the media player entity
+    entity = JukeboxMediaPlayer(
+        entry=entry,
+        host=host,
+        port=port,
+        username=username,
+        password=password,
+        use_ssl=use_ssl,
+    )
+    async_add_entities([entity], update_before_add=True)
+
+
+class JukeboxMediaPlayer(MediaPlayerEntity):
+    """Representation of a Jukebox Media Player."""
+
+    def __init__(
+        self,
+        entry: ConfigEntry,
+        host: str,
+        port: int,
+        username: str,
+        password: str,
+        use_ssl: bool,
+    ) -> None:
+        """Initialize the Jukebox Media Player."""
+        self._entry = entry
+        self._host = host
+        self._port = port
+        self._username = username
+        self._password = password
+        self._use_ssl = use_ssl
+        self._attr_name = f"Jukebox {host}"
+        self._attr_state = MediaPlayerState.IDLE
+        self._track_info = {}
+        self._attr_volume_level = None
+        self._attr_is_volume_muted = False
+
+        # Media position tracking
+        self._attr_media_position = None
+        self._attr_media_position_updated_at = None
+
+        # Source selection (Chromecast devices)
+        self._attr_source = None
+        self._attr_source_list = []
+
+        # Websocket connection
+        self._websocket = None
+        self._websocket_task = None
+        self._websocket_reconnect_interval = 5
+
+        # Build API base URL
+        protocol = "https" if use_ssl else "http"
+        # Handle default ports
+        if (protocol == "https" and port == 443) or (protocol == "http" and port == 80):
+            self._api_base = f"{protocol}://{host}/api"
+            self._ws_base = f"{'wss' if use_ssl else 'ws'}://{host}/ws/mediaplayer"
+        else:
+            self._api_base = f"{protocol}://{host}:{port}/api"
+            self._ws_base = (
+                f"{'wss' if use_ssl else 'ws'}://{host}:{port}/ws/mediaplayer"
+            )
+
+        # Prepare basic auth headers for NPM
+        self._auth_headers = {}
+        if username and password:
+            credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
+            self._auth_headers["Authorization"] = f"Basic {credentials}"
+            _LOGGER.debug("Using basic authentication (NPM will inject API key)")
+        else:
+            _LOGGER.error("Username and password are required for NPM basic auth")
+
+    @property
+    def unique_id(self) -> str:
+        """Return unique ID for this entity."""
+        return f"{self._entry.entry_id}_media_player"
+
+    @property
+    def should_poll(self) -> bool:
+        """Return False as we use websockets for real-time updates."""
+        return False
+
+    _attr_device_class = MediaPlayerDeviceClass.SPEAKER
+
+    @property
+    def media_title(self) -> str | None:
+        """Title of current playing media."""
+        return self._track_info.get("title")
+
+    @property
+    def media_artist(self) -> str | None:
+        """Artist of current playing media."""
+        return self._track_info.get("artist")
+
+    @property
+    def media_album_name(self) -> str | None:
+        """Album name of current playing media."""
+        return self._track_info.get("album")
+
+    @property
+    def media_track(self) -> int | None:
+        """Track number of current playing media."""
+        return self._track_info.get("track_number")
+
+    @property
+    def media_duration(self) -> int | None:
+        """Duration of current playing media in seconds."""
+        duration_str = self._track_info.get("duration")
+        if duration_str:
+            try:
+                # Convert MM:SS or HH:MM:SS to seconds
+                parts = duration_str.split(":")
+                if len(parts) == 2:
+                    return int(parts[0]) * 60 + int(parts[1])
+                elif len(parts) == 3:
+                    return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+            except (ValueError, TypeError):
+                pass
+        return None
+
+    @property
+    def media_position(self) -> int | None:
+        """Position of current playing media in seconds."""
+        return self._attr_media_position
+
+    @property
+    def media_position_updated_at(self) -> datetime | None:
+        """When the position was last updated."""
+        return self._attr_media_position_updated_at
+
+    @property
+    def media_image_url(self) -> str | None:
+        """Image URL of current playing media."""
+        # Try the new absolute thumb URL first
+        thumb_abs = self._track_info.get("thumb_abs")
+        if thumb_abs:
+            # thumb_abs should already be a complete URL, return as-is
+            _LOGGER.debug("Using thumb_abs: %s", thumb_abs)
+            return thumb_abs
+
+        _LOGGER.debug("No thumb image found in track info")
+        return None
+
+    @property
+    def media_content_type(self) -> str | None:
+        """Content type of current playing media."""
+        # Return 'music' for audio tracks
+        if self._track_info.get("title") or self._track_info.get("artist"):
+            return "music"
+        return None
+
+    @property
+    def media_content_id(self) -> str | None:
+        """Content ID of current playing media."""
+        # Use track_id if available, otherwise generate from title/artist
+        track_id = self._track_info.get("track_id")
+        if track_id:
+            return str(track_id)
+
+        # Fallback: create ID from title and artist
+        title = self._track_info.get("title")
+        artist = self._track_info.get("artist")
+        if title and artist:
+            return f"{artist}_{title}".replace(" ", "_").lower()
+        elif title:
+            return title.replace(" ", "_").lower()
+        return None
+
+    @property
+    def media_playlist(self) -> str | None:
+        """Playlist name if track is part of a playlist."""
+        return self._track_info.get("playlist_name") or self._track_info.get("playlist")
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return additional state attributes for the media player."""
+        attrs = {}
+
+        # Add genre if available
+        if self._track_info.get("genre"):
+            attrs["genre"] = self._track_info.get("genre")
+
+        # Add year if available
+        if self._track_info.get("year"):
+            attrs["year"] = self._track_info.get("year")
+
+        # Add file format/codec if available
+        if self._track_info.get("format") or self._track_info.get("codec"):
+            attrs["format"] = self._track_info.get("format") or self._track_info.get(
+                "codec"
+            )
+
+        # Add bitrate if available
+        if self._track_info.get("bitrate"):
+            attrs["bitrate"] = self._track_info.get("bitrate")
+
+        # Add file path if available (useful for debugging)
+        if self._track_info.get("file_path"):
+            attrs["file_path"] = self._track_info.get("file_path")
+
+        # Add playlist position if available
+        if self._track_info.get("track_number"):
+            attrs["playlist_position"] = self._track_info.get("track_number")
+
+        # Add total tracks in playlist if available
+        if self._track_info.get("playlist_total"):
+            attrs["playlist_total"] = self._track_info.get("playlist_total")
+
+        return attrs
+
+    @property
+    def supported_features(self) -> MediaPlayerEntityFeature:
+        """Flag media player features that are supported."""
+        return (
+            MediaPlayerEntityFeature.PLAY
+            | MediaPlayerEntityFeature.PAUSE
+            | MediaPlayerEntityFeature.STOP
+            | MediaPlayerEntityFeature.NEXT_TRACK
+            | MediaPlayerEntityFeature.PREVIOUS_TRACK
+            | MediaPlayerEntityFeature.VOLUME_STEP
+            | MediaPlayerEntityFeature.VOLUME_SET
+            | MediaPlayerEntityFeature.BROWSE_MEDIA
+            | MediaPlayerEntityFeature.PLAY_MEDIA
+            | MediaPlayerEntityFeature.SELECT_SOURCE
+        )
+
+    async def async_added_to_hass(self) -> None:
+        """Run when entity is added to hass."""
+        await super().async_added_to_hass()
+        # Fetch initial source information
+        try:
+            await self._update_sources()
+        except Exception as e:
+            _LOGGER.debug("Error fetching initial source information: %s", e)
+        # Start websocket connection
+        await self._start_websocket()
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Run when entity will be removed from hass."""
+        await super().async_will_remove_from_hass()
+        # Close websocket connection
+        await self._stop_websocket()
+
+    async def async_update(self) -> None:
+        """Update the state of the media player."""
+        # If websocket is connected, we get real-time updates and don't need to poll
+        if self._websocket and not self._websocket.closed:
+            return
+
+        # Fallback to polling if websocket isn't working
+        try:
+            session = async_get_clientsession(self.hass)
+            data = await self._fetch_current_track(session)
+            await self._update_from_data(data)
+        except Exception as e:
+            _LOGGER.error("Error updating Jukebox Media Player: %s", e)
+            self._attr_state = MediaPlayerState.UNAVAILABLE
+
+    async def _update_from_data(self, data: dict[str, Any]) -> None:
+        """Update entity state from websocket or API data."""
+        try:
+            # Handle jukebox data structure from websocket or API
+            if "status" in data:
+                status = data["status"]
+                if status in ["PLAY", "playing"]:
+                    self._attr_state = MediaPlayerState.PLAYING
+                elif status in ["PAUSE", "paused"]:
+                    self._attr_state = MediaPlayerState.PAUSED
+                elif status in ["STOP", "idle", "STOP"]:
+                    self._attr_state = MediaPlayerState.IDLE
+                else:
+                    self._attr_state = MediaPlayerState.IDLE
+
+            # Handle current track info
+            if "current_track" in data and data["current_track"]:
+                self._track_info = data["current_track"]
+            else:
+                self._track_info = {}
+
+            # Update volume information from jukebox context (0-100 range)
+            if "volume" in data:
+                volume = data["volume"]
+                if volume is not None:
+                    # Convert jukebox volume (0-100) to HA volume (0-1)
+                    old_volume = self._attr_volume_level
+                    self._attr_volume_level = volume / 100.0
+                    _LOGGER.debug(
+                        "🔊 VOLUME UPDATE: %s (0-100) → %s (0-1), changed from %s",
+                        volume,
+                        self._attr_volume_level,
+                        old_volume,
+                    )
+                else:
+                    _LOGGER.debug("🔊 VOLUME: Received None volume")
+            else:
+                _LOGGER.debug("🔊 VOLUME: No volume data found in websocket message")
+
+            # Update media position if available (from track timer)
+            if "elapsed_time" in data:
+                self._attr_media_position = int(data["elapsed_time"])
+                self._attr_media_position_updated_at = utcnow()
+
+            # Schedule entity update
+            if self.hass and self.entity_id:
+                self.async_schedule_update_ha_state()
+            else:
+                _LOGGER.debug("Entity not fully registered yet, skipping state update")
+
+        except Exception as e:
+            _LOGGER.error("Error updating from data: %s", e)
+
+        # Also update source information (Chromecast devices)
+        # Do this separately to avoid blocking track updates
+        try:
+            await self._update_sources()
+        except Exception as e:
+            _LOGGER.debug("Error updating source information: %s", e)
+
+    async def _fetch_current_track(
+        self, session: aiohttp.ClientSession
+    ) -> dict[str, Any]:
+        """Fetch current track information from the Jukebox API."""
+        result = await self._make_api_request(
+            "mediaplayer/status", method="GET", return_json=True
+        )
+        if isinstance(result, dict):
+            return result
+        # Return empty dict if request failed
+        return {}
+
+    async def _make_api_request(
+        self,
+        endpoint: str,
+        method: str = "POST",
+        params: dict[str, Any] | None = None,
+        return_json: bool = False,
+    ) -> bool | dict[str, Any]:
+        """Make an authenticated request to the Jukebox API.
+
+        Args:
+            endpoint: API endpoint (e.g., "status", "play", "volume_set")
+            method: HTTP method ("GET" or "POST")
+            params: Query parameters to include in the request
+            return_json: If True, return the JSON response dict; otherwise return success bool
+
+        Returns:
+            If return_json is True: dict with JSON response (empty dict on error)
+            If return_json is False: bool indicating success (status < 400)
+        """
+        try:
+            session = async_get_clientsession(self.hass)
+            url = f"{self._api_base}/{endpoint}"
+
+            # Configure SSL context for HTTPS requests
+            ssl_context = False
+            if self._use_ssl:
+                # Run blocking SSL context creation in executor
+                ssl_context = await self.hass.async_add_executor_job(
+                    ssl.create_default_context
+                )
+                # For development/self-signed certificates, you might want to disable verification
+                # ssl_context.check_hostname = False
+                # ssl_context.verify_mode = ssl.CERT_NONE
+
+            # Make the request
+            request_method = session.post if method.upper() == "POST" else session.get
+
+            async with request_method(
+                url,
+                params=params,
+                headers=self._auth_headers,
+                ssl=ssl_context,
+            ) as response:
+                if return_json:
+                    if response.status < 400:
+                        return await response.json()
+                    _LOGGER.error(
+                        "API request to %s failed with status %s",
+                        endpoint,
+                        response.status,
+                    )
+                    return {}
+                return response.status < 400
+        except Exception as e:
+            _LOGGER.error("API request to %s failed: %s", endpoint, e)
+            return {} if return_json else False
+
+    async def async_media_play(self) -> None:
+        """Send play command."""
+        await self._make_api_request("mediaplayer/play")
+
+    async def async_media_pause(self) -> None:
+        """Send pause command."""
+        await self._make_api_request("mediaplayer/play_pause")
+
+    async def async_media_stop(self) -> None:
+        """Send stop command."""
+        await self._make_api_request("mediaplayer/stop")
+
+    async def async_media_next_track(self) -> None:
+        """Send next track command."""
+        await self._make_api_request("mediaplayer/next_track")
+
+    async def async_media_previous_track(self) -> None:
+        """Send previous track command."""
+        await self._make_api_request("mediaplayer/previous_track")
+
+    async def async_volume_up(self) -> None:
+        """Volume up the media player."""
+        await self._make_api_request("mediaplayer/volume_up")
+
+    async def async_volume_down(self) -> None:
+        """Volume down the media player."""
+        await self._make_api_request("mediaplayer/volume_down")
+
+    async def async_select_source(self, source: str) -> None:
+        """Select playback source (Chromecast device)."""
+        success = await self._make_api_request(
+            "chromecast/switch",
+            method="POST",
+            params={"device_name": source},
+        )
+
+        if success:
+            _LOGGER.debug("Successfully switched to source: %s", source)
+            # Update the source immediately for responsive UI
+            self._attr_source = source
+            self.async_schedule_update_ha_state()
+            # Refresh source list after switching
+            await self._update_sources()
+        else:
+            _LOGGER.error("Failed to switch to source: %s", source)
+
+    async def _update_sources(self) -> None:
+        """Update available sources and active source from Chromecast status."""
+        chromecast_status = await self._make_api_request(
+            "chromecast/status",
+            method="GET",
+            return_json=True,
+        )
+
+        if not isinstance(chromecast_status, dict):
+            return
+
+        # Update available devices (sources)
+        available_devices = chromecast_status.get("available_devices", [])
+        if available_devices:
+            self._attr_source_list = [
+                device.get("name") for device in available_devices if device.get("name")
+            ]
+
+        # Update active device (current source)
+        active_device = chromecast_status.get("active_device")
+        if active_device:
+            self._attr_source = active_device
+
+    async def async_play_media(
+        self,
+        media_type: str,
+        media_id: str,
+        **kwargs: Any,
+    ) -> None:
+        """Play media from browse media."""
+        _LOGGER.debug("Play media called: type=%s, id=%s", media_type, media_id)
+
+        # Parse the media_id to determine what to play
+        # Format: "album:{album_id}" or "track:{track_id}"
+        if media_id.startswith("album:"):
+            album_id = media_id.split(":", 1)[1]
+            await self._play_album(album_id)
+        elif media_id.startswith("track:"):
+            track_id = media_id.split(":", 1)[1]
+            await self._play_track(track_id)
+        else:
+            _LOGGER.warning("Unknown media_id format: %s", media_id)
+
+    async def _play_album(self, album_id: str) -> None:
+        """Play an album by its ID."""
+        success = await self._make_api_request(
+            f"mediaplayer/play_album_from_albumid/{album_id}",
+            method="POST",
+        )
+        if success:
+            _LOGGER.debug("Successfully started playing album: %s", album_id)
+        else:
+            _LOGGER.error("Failed to play album: %s", album_id)
+
+    async def _play_track(self, track_data: str) -> None:
+        """Play a track by loading its album and starting at the track index.
+
+        Args:
+            track_data: Format is "album_id:track_index" where track_index is 0-based
+        """
+        try:
+            # Parse track_data: "album_id:track_index"
+            parts = track_data.split(":", 1)
+            if len(parts) != 2:
+                _LOGGER.error("Invalid track data format: %s", track_data)
+                return
+
+            album_id, track_index_str = parts
+            track_index = int(track_index_str)
+
+            # Play album starting at the specific track
+            success = await self._make_api_request(
+                f"mediaplayer/play_album_from_albumid/{album_id}",
+                method="POST",
+                params={"start_track_index": track_index},
+            )
+
+            if success:
+                _LOGGER.debug(
+                    "Successfully started playing track %s from album: %s",
+                    track_index,
+                    album_id,
+                )
+            else:
+                _LOGGER.error(
+                    "Failed to play track %s from album: %s", track_index, album_id
+                )
+        except (ValueError, IndexError) as e:
+            _LOGGER.error("Error parsing track data '%s': %s", track_data, e)
+
+    async def async_set_volume_level(self, volume: float) -> None:
+        """Set volume level, range 0..1."""
+        # Convert HA volume (0-1) to jukebox volume (0-100)
+        jukebox_volume = int(volume * 100)
+        jukebox_volume = max(0, min(100, jukebox_volume))  # Clamp to valid range
+
+        # Use the new volume_set endpoint with query parameter
+        success = await self._make_api_request(
+            "mediaplayer/volume_set",
+            method="POST",
+            params={"volume": jukebox_volume},
+        )
+
+        if success:
+            _LOGGER.debug(
+                "Successfully set volume to %s via volume_set endpoint",
+                jukebox_volume,
+            )
+            # Update local volume level immediately for responsive UI
+            self._attr_volume_level = volume
+            self.async_schedule_update_ha_state()
+        else:
+            _LOGGER.warning(
+                "Failed to set volume via volume_set endpoint, using fallback"
+            )
+            # Fallback to incremental volume adjustment
+            await self._adjust_volume_incrementally(jukebox_volume)
+
+    async def _adjust_volume_incrementally(self, target_volume: int) -> None:
+        """Adjust volume incrementally using volume_up/volume_down."""
+        try:
+            current_vol = (
+                self._attr_volume_level * 100 if self._attr_volume_level else 50
+            )
+            diff = target_volume - current_vol
+
+            if abs(diff) <= 2:  # Close enough, don't adjust
+                return
+
+            # Use volume_up or volume_down to get closer to target
+            if diff > 0:
+                # Need to increase volume
+                steps = min(int(abs(diff) // 5), 10)  # Limit to 10 steps max
+                for _ in range(steps):
+                    await self._make_api_request("mediaplayer/volume_up")
+                    await asyncio.sleep(0.1)  # Small delay between steps
+            else:
+                # Need to decrease volume
+                steps = min(int(abs(diff) // 5), 10)  # Limit to 10 steps max
+                for _ in range(steps):
+                    await self._make_api_request("mediaplayer/volume_down")
+                    await asyncio.sleep(0.1)  # Small delay between steps
+
+        except Exception as e:
+            _LOGGER.error("Error adjusting volume incrementally: %s", e)
+
+    async def _start_websocket(self) -> None:
+        """Start the websocket connection."""
+        if self._websocket_task and not self._websocket_task.done():
+            return
+
+        self._websocket_task = asyncio.create_task(self._websocket_loop())
+        _LOGGER.debug("Started websocket connection task")
+
+    async def _stop_websocket(self) -> None:
+        """Stop the websocket connection."""
+        if self._websocket_task:
+            self._websocket_task.cancel()
+            try:
+                await self._websocket_task
+            except asyncio.CancelledError:
+                pass
+            self._websocket_task = None
+
+        if self._websocket and not self._websocket.closed:
+            await self._websocket.close()
+            self._websocket = None
+
+        _LOGGER.debug("Stopped websocket connection")
+
+    async def _websocket_loop(self) -> None:
+        """Main websocket connection loop with reconnection."""
+        while True:
+            try:
+                await self._connect_websocket()
+            except asyncio.CancelledError:
+                _LOGGER.debug("Websocket loop cancelled")
+                break
+            except Exception as e:
+                _LOGGER.error("Websocket connection failed: %s", e)
+
+            # Wait before reconnecting
+            try:
+                await asyncio.sleep(self._websocket_reconnect_interval)
+            except asyncio.CancelledError:
+                break
+
+    async def _connect_websocket(self) -> None:
+        """Connect to the websocket and handle messages."""
+        session = async_get_clientsession(self.hass)
+        ws_url = f"{self._ws_base}/status"
+
+        # Configure SSL context for WSS
+        ssl_context = False
+        if self._use_ssl:
+            ssl_context = await self.hass.async_add_executor_job(
+                ssl.create_default_context
+            )
+
+        _LOGGER.debug("Connecting to websocket: %s", ws_url)
+
+        try:
+            # Try connecting with basic auth headers first
+            self._websocket = await session.ws_connect(
+                ws_url,
+                headers=self._auth_headers,
+                ssl=ssl_context,
+            )
+
+            _LOGGER.warning("🔗 WEBSOCKET CONNECTED to jukebox successfully!")
+            self._attr_state = MediaPlayerState.IDLE  # Clear unavailable state
+
+            # Listen for messages
+            async for msg in self._websocket:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    try:
+                        # Log ALL websocket messages for debugging
+                        _LOGGER.warning("RAW WEBSOCKET MESSAGE: %s", msg.data)
+
+                        data = json.loads(msg.data)
+                        _LOGGER.warning("PARSED WEBSOCKET DATA: %s", data)
+
+                        # Handle typed messages from server
+                        msg_type = data.get("type")
+                        payload = data.get("payload", {})
+
+                        _LOGGER.debug("WebSocket message type: %s", msg_type)
+
+                        # Only process current_track messages, ignore ping and other types
+                        if msg_type == "current_track":
+                            _LOGGER.warning("✅ PROCESSING current_track message")
+                            try:
+                                await self._update_from_data(payload)
+                            except Exception as update_error:
+                                _LOGGER.error(
+                                    "Error processing websocket data: %s", update_error
+                                )
+                                # Don't break the websocket connection for data processing errors
+                        elif msg_type == "ping":
+                            _LOGGER.debug("Received server ping, ignoring")
+                        else:
+                            _LOGGER.debug(
+                                "Ignoring websocket message type: %s", msg_type
+                            )
+
+                    except json.JSONDecodeError as e:
+                        _LOGGER.warning(
+                            "❌ IGNORING non-JSON websocket message: %s",
+                            msg.data.strip(),
+                        )
+                elif msg.type == aiohttp.WSMsgType.PING:
+                    _LOGGER.debug("Received websocket PING, sending PONG")
+                    # aiohttp automatically handles PING/PONG, but we can log it
+                    continue
+                elif msg.type == aiohttp.WSMsgType.PONG:
+                    _LOGGER.debug("Received websocket PONG")
+                    continue
+                elif msg.type == aiohttp.WSMsgType.ERROR:
+                    _LOGGER.error("Websocket error: %s", self._websocket.exception())
+                    break
+                elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED):
+                    _LOGGER.info("Websocket closed")
+                    break
+
+        except aiohttp.ClientResponseError as e:
+            if e.status == 401:
+                _LOGGER.error(
+                    "Websocket authentication failed - check NPM basic auth credentials"
+                )
+                # Try connecting without auth headers as fallback
+                try:
+                    _LOGGER.debug("Trying websocket connection without auth headers")
+                    self._websocket = await session.ws_connect(ws_url, ssl=ssl_context)
+                    _LOGGER.info("Websocket connected without auth")
+
+                    # Continue with message processing
+                    async for msg in self._websocket:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            try:
+                                data = json.loads(msg.data)
+
+                                # Handle typed messages from server
+                                msg_type = data.get("type")
+                                payload = data.get("payload", {})
+
+                                # Only process current_track messages
+                                if msg_type == "current_track":
+                                    _LOGGER.debug(
+                                        "Received current_track message (fallback): %s",
+                                        payload,
+                                    )
+                                    await self._update_from_data(payload)
+                                elif msg_type == "ping":
+                                    _LOGGER.debug(
+                                        "Received server ping (fallback), ignoring"
+                                    )
+                                else:
+                                    _LOGGER.debug(
+                                        "Ignoring websocket message type (fallback): %s",
+                                        msg_type,
+                                    )
+
+                            except json.JSONDecodeError as e:
+                                _LOGGER.debug(
+                                    "Ignoring non-JSON websocket message (fallback): %s",
+                                    msg.data.strip(),
+                                )
+                        elif msg.type == aiohttp.WSMsgType.PING:
+                            _LOGGER.debug(
+                                "Received websocket PING (fallback connection)"
+                            )
+                            continue
+                        elif msg.type == aiohttp.WSMsgType.PONG:
+                            _LOGGER.debug(
+                                "Received websocket PONG (fallback connection)"
+                            )
+                            continue
+                        elif msg.type == aiohttp.WSMsgType.ERROR:
+                            _LOGGER.error(
+                                "Websocket error: %s", self._websocket.exception()
+                            )
+                            break
+                        elif msg.type in (
+                            aiohttp.WSMsgType.CLOSE,
+                            aiohttp.WSMsgType.CLOSED,
+                        ):
+                            _LOGGER.info("Websocket closed")
+                            break
+
+                except Exception as fallback_e:
+                    _LOGGER.error(
+                        "Websocket fallback connection also failed: %s", fallback_e
+                    )
+                    self._attr_state = MediaPlayerState.UNAVAILABLE
+            else:
+                _LOGGER.error("Websocket HTTP error %s: %s", e.status, e)
+                self._attr_state = MediaPlayerState.UNAVAILABLE
+        except asyncio.CancelledError:
+            _LOGGER.debug("Websocket connection cancelled")
+            raise
+        except aiohttp.ClientError as e:
+            _LOGGER.error("Websocket client error: %s", e)
+            self._attr_state = MediaPlayerState.UNAVAILABLE
+        except Exception as e:
+            _LOGGER.error("Websocket connection error: %s", e)
+            self._attr_state = MediaPlayerState.UNAVAILABLE
+        finally:
+            if self._websocket and not self._websocket.closed:
+                await self._websocket.close()
+            self._websocket = None
+
+    def _is_valid_jukebox_data(self, data: dict[str, Any]) -> bool:
+        """Validate that the websocket data contains expected jukebox structure."""
+        if not isinstance(data, dict):
+            _LOGGER.debug("Invalid data: not a dict - %s", type(data))
+            return False
+
+        # Log what we received for debugging
+        _LOGGER.warning("🔍 VALIDATING websocket data keys: %s", list(data.keys()))
+
+        # Check for ping messages first and reject them
+        if data.get("status") == "ping":
+            _LOGGER.warning("❌ VALIDATION FAILED: ignoring ping message")
+            return False
+
+        # Must have at least one expected key from jukebox data structure
+        expected_keys = ["status", "current_track", "playlist", "volume", "elapsed"]
+        if not any(key in data for key in expected_keys):
+            _LOGGER.warning(
+                "❌ VALIDATION FAILED: no expected keys found. Got: %s",
+                list(data.keys()),
+            )
+            return False
+
+        # If status exists, it should be a valid player status, not ping/pong
+        if "status" in data:
+            status = data["status"]
+            valid_statuses = [
+                "playing",
+                "paused",
+                "stopped",
+                "idle",
+                "PLAY",
+                "PAUSE",
+                "STOP",
+            ]
+            if status not in valid_statuses:
+                _LOGGER.warning(
+                    "❌ VALIDATION FAILED: invalid status '%s' (expected: %s)",
+                    status,
+                    valid_statuses,
+                )
+                return False
+
+        # If current_track exists, validate it
+        if "current_track" in data:
+            current_track = data["current_track"]
+            # Allow null/None current_track (no track playing)
+            if current_track is not None:
+                if not isinstance(current_track, dict):
+                    _LOGGER.warning(
+                        "❌ VALIDATION FAILED: current_track not a dict - %s",
+                        type(current_track),
+                    )
+                    return False
+                # If it's a dict with data, it should have some track fields
+                if current_track:  # Non-empty dict
+                    track_fields = ["artist", "title", "album", "duration", "track_id"]
+                    if not any(field in current_track for field in track_fields):
+                        _LOGGER.warning(
+                            "❌ VALIDATION FAILED: current_track has no recognized fields - %s",
+                            list(current_track.keys()),
+                        )
+                        return False
+
+        _LOGGER.warning("✅ VALIDATION PASSED")
+        return True
+
+    async def async_browse_media(
+        self,
+        media_content_type: str | None = None,
+        media_content_id: str | None = None,
+    ) -> BrowseMedia:
+        """Implement the websocket media browsing helper."""
+        _LOGGER.debug(
+            "Browse media called with type=%s, id=%s",
+            media_content_type,
+            media_content_id,
+        )
+
+        # Root level - show artists
+        if media_content_id is None:
+            return await self._browse_root()
+
+        # Parse the media_content_id to determine what to show
+        # Format: "artist:{artist_id}" or "album:{album_id}"
+        if media_content_id.startswith("artist:"):
+            artist_id = media_content_id.split(":", 1)[1]
+            return await self._browse_artist_albums(artist_id)
+        if media_content_id.startswith("album:"):
+            album_id = media_content_id.split(":", 1)[1]
+            return await self._browse_album_tracks(album_id)
+
+        # Fallback to root
+        return await self._browse_root()
+
+    async def _browse_root(self) -> BrowseMedia:
+        """Browse root level - show all artists."""
+        artists_data = await self._make_api_request(
+            "subsonic/artists",
+            method="GET",
+            return_json=True,
+        )
+
+        # artists_data is directly a list of artists
+        if not isinstance(artists_data, list):
+            artists_data = []
+
+        # Build artist list
+        children = []
+
+        for artist in artists_data:
+            artist_id = artist.get("id")
+            artist_name = artist.get("name")
+
+            if artist_id and artist_name:
+                children.append(
+                    BrowseMedia(
+                        title=artist_name,
+                        media_class=MediaClass.ARTIST,
+                        media_content_type=MediaType.ARTIST,
+                        media_content_id=f"artist:{artist_id}",
+                        can_play=False,
+                        can_expand=True,
+                    )
+                )
+
+        return BrowseMedia(
+            title="Artists",
+            media_class=MediaClass.DIRECTORY,
+            media_content_type="library",
+            media_content_id="root",
+            can_play=False,
+            can_expand=True,
+            children=children,
+        )
+
+    async def _browse_artist_albums(self, artist_id: str) -> BrowseMedia:
+        """Browse albums for a specific artist."""
+        albums_data = await self._make_api_request(
+            f"subsonic/artist/{artist_id}",
+            method="GET",
+            return_json=True,
+        )
+
+        # albums_data is directly a list of albums
+        if not isinstance(albums_data, list):
+            albums_data = []
+
+        # Build album list
+        children = []
+
+        for album in albums_data:
+            album_id = album.get("id")
+            album_name = album.get("name")
+            album_year = album.get("year")
+            cover_url = album.get("cover_url")
+
+            # Build absolute URL for cover if it's a relative path
+            thumbnail = None
+            if cover_url:
+                if cover_url.startswith("http"):
+                    thumbnail = cover_url
+                else:
+                    # Build absolute URL using the same base as API
+                    protocol = "https" if self._use_ssl else "http"
+                    if (protocol == "https" and self._port == 443) or (
+                        protocol == "http" and self._port == 80
+                    ):
+                        thumbnail = f"{protocol}://{self._host}{cover_url}"
+                    else:
+                        thumbnail = f"{protocol}://{self._host}:{self._port}{cover_url}"
+
+            if album_id and album_name:
+                title = f"{album_name} ({album_year})" if album_year else album_name
+                children.append(
+                    BrowseMedia(
+                        title=title,
+                        media_class=MediaClass.ALBUM,
+                        media_content_type=MediaType.ALBUM,
+                        media_content_id=f"album:{album_id}",
+                        can_play=True,  # Can play entire album
+                        can_expand=True,  # Can browse tracks
+                        thumbnail=thumbnail,
+                    )
+                )
+
+        # Get artist name from first album or use ID as fallback
+        artist_name = f"Artist {artist_id}"
+
+        return BrowseMedia(
+            title=f"{artist_name} - Albums",
+            media_class=MediaClass.ARTIST,
+            media_content_type=MediaType.ARTIST,
+            media_content_id=f"artist:{artist_id}",
+            can_play=False,
+            can_expand=True,
+            children=children,
+        )
+
+    async def _browse_album_tracks(self, album_id: str) -> BrowseMedia:
+        """Browse tracks for a specific album."""
+        tracks_data = await self._make_api_request(
+            f"subsonic/album/{album_id}",
+            method="GET",
+            return_json=True,
+        )
+
+        # tracks_data is directly a list of tracks
+        if not isinstance(tracks_data, list):
+            tracks_data = []
+
+        # Build track list
+        children = []
+        album_name = None
+        album_art_url = None
+
+        for index, track in enumerate(tracks_data):
+            track_id = track.get("id")
+            track_title = track.get("title")
+            track_artist = track.get("artist")
+            track_number = track.get("track")
+            duration = track.get("duration")
+            album_id_from_track = track.get("albumId")
+            cover_art = track.get("coverArt")
+
+            # Get album name from first track
+            if not album_name and track.get("album"):
+                album_name = track.get("album")
+
+            # Build cover art URL if available
+            if not album_art_url and cover_art:
+                protocol = "https" if self._use_ssl else "http"
+                if (protocol == "https" and self._port == 443) or (
+                    protocol == "http" and self._port == 80
+                ):
+                    album_art_url = f"{protocol}://{self._host}/assets/covers/{cover_art}/cover-180.webp"
+                else:
+                    album_art_url = f"{protocol}://{self._host}:{self._port}/assets/covers/{cover_art}/cover-180.webp"
+
+            if track_id and track_title:
+                # Format: track:{album_id}:{track_index}
+                # Store both album ID and track index for playing
+                title = (
+                    f"{track_number}. {track_title}" if track_number else track_title
+                )
+                if track_artist:
+                    title = f"{title} - {track_artist}"
+
+                children.append(
+                    BrowseMedia(
+                        title=title,
+                        media_class=MediaClass.TRACK,
+                        media_content_type=MediaType.TRACK,
+                        media_content_id=f"track:{album_id_from_track or album_id}:{index}",
+                        can_play=True,
+                        can_expand=False,
+                    )
+                )
+
+        album_name = album_name or f"Album {album_id}"
+
+        return BrowseMedia(
+            title=album_name,
+            media_class=MediaClass.ALBUM,
+            media_content_type=MediaType.ALBUM,
+            media_content_id=f"album:{album_id}",
+            can_play=True,
+            can_expand=True,
+            children=children,
+            thumbnail=album_art_url,
+        )
