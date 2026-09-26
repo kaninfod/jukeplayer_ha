@@ -3,10 +3,12 @@
     "step": {
       "user": {
         "data": {
-          "host": "[%key:common::config_flow::data::host%]"
+          "host": "[%key:common::config_flow::data::host%]",
+          "port": "Port"
         },
         "data_description": {
-          "host": "The hostname or IP address of your Jukebox server."
+          "host": "The hostname or IP address of your Jukebox server.",
+          "port": "The backend's HTTP port (default 8000; omit from URLs when 80)."
         }
       }
     },

@@ -29,7 +29,6 @@ from .websocket_handler import JukeboxWebSocket
 _LOGGER = logging.getLogger(__name__)
 
 # Configuration constants
-CONF_USE_SSL = "use_ssl"
 CONF_PORT = "port"
 
 
@@ -40,15 +39,13 @@ async def async_setup_entry(
 ) -> None:
     """Set up Jukebox media player from a config entry."""
     host = entry.data[CONF_HOST]
-    use_ssl = entry.data.get(CONF_USE_SSL, True)
-    port = entry.data.get(CONF_PORT, 443 if use_ssl else 80)
+    port = entry.data.get(CONF_PORT, 8000)
 
     # Create the media player entity
     entity = JukeboxMediaPlayer(
         entry=entry,
         host=host,
         port=port,
-        use_ssl=use_ssl,
     )
     async_add_entities([entity], update_before_add=True)
 
@@ -61,13 +58,15 @@ class JukeboxMediaPlayer(MediaPlayerEntity):
         entry: ConfigEntry,
         host: str,
         port: int,
-        use_ssl: bool,
     ) -> None:
-        """Initialize the Jukebox Media Player."""
+        """Initialize the Jukebox Media Player.
+
+        The backend is LAN-only plain HTTP by design — no TLS support; the
+        port is omitted from URLs when it is the scheme default (80).
+        """
         self._entry = entry
         self._host = host
         self._port = port
-        self._use_ssl = use_ssl
         self._attr_name = f"Jukebox {host}"
         self._attr_state = MediaPlayerState.IDLE
         self._track_info = {}
@@ -85,20 +84,17 @@ class JukeboxMediaPlayer(MediaPlayerEntity):
         # Repeat mode
         self._attr_repeat = RepeatMode.OFF
 
-        # Build WebSocket URL
-        protocol = "https" if use_ssl else "http"
-        ws_protocol = "wss" if use_ssl else "ws"
-        if (protocol == "https" and port == 443) or (protocol == "http" and port == 80):
-            ws_url = f"{ws_protocol}://{host}/ws/mediaplayer/events?detail=full&client_name=homeassistant"
+        # Build WebSocket URL (http/ws; port omitted when 80)
+        if port == 80:
+            ws_url = "ws://{host}/ws/mediaplayer/events?detail=full&client_name=homeassistant".format(host=host)
         else:
-            ws_url = f"{ws_protocol}://{host}:{port}/ws/mediaplayer/events?detail=full&client_name=homeassistant"
+            ws_url = f"ws://{host}:{port}/ws/mediaplayer/events?detail=full&client_name=homeassistant"
 
         # Initialize helper modules
         self._api_client = JukeboxAPIClient(
             hass=None,  # Will be set in async_added_to_hass
             host=host,
             port=port,
-            use_ssl=use_ssl,
         )
         self._ws_url = ws_url
 
@@ -106,7 +102,6 @@ class JukeboxMediaPlayer(MediaPlayerEntity):
             api_client=self._api_client,
             host=host,
             port=port,
-            use_ssl=use_ssl,
             get_browse_image_url=self.get_browse_image_url,
         )
 
@@ -178,11 +173,10 @@ class JukeboxMediaPlayer(MediaPlayerEntity):
             # If already absolute, return as-is
             if cover_url.startswith("http://") or cover_url.startswith("https://"):
                 return cover_url
-            # Otherwise, prepend protocol, host, and port
-            protocol = "https" if self._use_ssl else "http"
-            if (protocol == "https" and self._port == 443) or (protocol == "http" and self._port == 80):
-                return f"{protocol}://{self._host}{cover_url}?size=512"
-            return f"{protocol}://{self._host}:{self._port}{cover_url}?size=512"
+            # Otherwise, prepend protocol, host, and port (port omitted when 80)
+            if self._port == 80:
+                return f"http://{self._host}{cover_url}?size=512"
+            return f"http://{self._host}:{self._port}{cover_url}?size=512"
         _LOGGER.debug("No cover_url found in track info")
         return None
 
@@ -285,8 +279,8 @@ class JukeboxMediaPlayer(MediaPlayerEntity):
         self._websocket_handler = JukeboxWebSocket(
             hass=self.hass,
             ws_url=self._ws_url,
-            use_ssl=self._port == 443 or self._use_ssl,
             data_callback=self._handle_websocket_message,
+            get_device_id=self._api_client.get_default_speaker,
         )
         await self._websocket_handler.start()
 
@@ -327,7 +321,6 @@ class JukeboxMediaPlayer(MediaPlayerEntity):
 
     async def _update_from_data(self, data: dict[str, Any]) -> None:
         """Update entity state from websocket or API data."""
-        _LOGGER.warning("Updating from data: %s", data["current_track"])  # Log the raw data for debugging
         try:
             # Handle jukebox data structure from websocket or API
             if "status" in data:
@@ -453,22 +446,16 @@ class JukeboxMediaPlayer(MediaPlayerEntity):
 
         # Find backend for the selected device
         devices = await self._api_client.get_output_devices()
-        # backend = None
         new_device = ""
         for device in devices:
             if device.get("name") == source:
-                # backend = device.get("backend")
                 new_device = device.get("device")
                 break
-        # if not backend:
-        #     _LOGGER.error("Could not find backend for source: %s", source)
-        #     return
-        #success = await self._api_client.switch_output_device(new_device, client_id)
-        success = await self._websocket_handler.send_message("switch_device", { "device_backend": "backend", "device_id": new_device })
+        success = await self._websocket_handler.send_message(
+            "switch_device", {"device_id": new_device}
+        )
         if success:
-            _LOGGER.debug(
-                "Successfully switched to source: %s (backend: %s)", source, "backend"
-            )
+            _LOGGER.debug("Successfully switched to source: %s", source)
             self._attr_source = source
             self.async_schedule_update_ha_state()
             await self._update_sources()
@@ -576,13 +563,10 @@ class JukeboxMediaPlayer(MediaPlayerEntity):
         if not media_image_id:
             return None, None
 
-        protocol = "https" if self._use_ssl else "http"
-        if (protocol == "https" and self._port == 443) or (
-            protocol == "http" and self._port == 80
-        ):
-            url = f"{protocol}://{self._host}/api/subsonic/cover/{media_image_id}"
+        if self._port == 80:
+            url = f"http://{self._host}/api/subsonic/cover/{media_image_id}"
         else:
-            url = f"{protocol}://{self._host}:{self._port}/api/subsonic/cover/{media_image_id}"
+            url = f"http://{self._host}:{self._port}/api/subsonic/cover/{media_image_id}"
 
         return await self._async_fetch_image_from_cache(url)
 

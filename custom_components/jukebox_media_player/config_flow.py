@@ -17,13 +17,10 @@ from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
-CONF_USE_SSL = "use_ssl"
-
 STEP_USER_DATA_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_HOST): str,
-        vol.Optional(CONF_PORT, default=443): int,
-        vol.Optional(CONF_USE_SSL, default=True): bool,
+        vol.Optional(CONF_PORT, default=8000): int,
     }
 )
 
@@ -45,7 +42,7 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
 class JukeboxFlowHandler(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Jukebox Mediaplayer."""
 
-    VERSION = 1
+    VERSION = 2
     MINOR_VERSION = 1
 
     async def async_step_user(

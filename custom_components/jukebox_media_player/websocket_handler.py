@@ -1,4 +1,4 @@
-"""WebSocket handler for Jukebox media player."""
+"""WebSocket handler for the Jukeplayer media player."""
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ import asyncio
 from collections.abc import Callable, Coroutine
 import json
 import logging
-import ssl
 from typing import Any
 
 import aiohttp
@@ -24,14 +23,20 @@ class JukeboxWebSocket:
         self,
         hass: HomeAssistant,
         ws_url: str,
-        use_ssl: bool,
         data_callback: Callable[[dict[str, Any]], Coroutine[Any, Any, None]],
+        get_device_id: Callable[[], Coroutine[Any, Any, str | None]] | None = None,
     ) -> None:
-        """Initialize the WebSocket handler."""
+        """Initialize the WebSocket handler.
+
+        get_device_id (optional) is awaited before every (re)connect so the
+        register payload carries the backend's current default speaker — that
+        is what lands the client on a speaker and keeps current_track
+        broadcasts flowing. No hardcoded speaker name.
+        """
         self.hass = hass
         self.ws_url = ws_url
-        self.use_ssl = use_ssl
         self.data_callback = data_callback
+        self.get_device_id = get_device_id
         self.client_id: str | None = None
 
         self._websocket: aiohttp.ClientWebSocketResponse | None = None
@@ -88,23 +93,26 @@ class JukeboxWebSocket:
         """Connect to the websocket and handle messages."""
         session = async_get_clientsession(self.hass)
 
-        # Configure SSL context for WSS
-        ssl_context = None
-        if self.use_ssl:
-            ssl_context = await self.hass.async_add_executor_job(
-                ssl.create_default_context
-            )
-
         _LOGGER.debug("Connecting to websocket: %s", self.ws_url)
 
         try:
             # Try connecting
             self._websocket = await session.ws_connect(
                 self.ws_url,
-                ssl=ssl_context,
             )
 
             _LOGGER.warning("🔗 WEBSOCKET CONNECTED to jukebox successfully!")
+
+            # Resolve the default speaker so the registration lands the
+            # client on a speaker (current_track broadcasts ride that
+            # assignment). None → backend default fallback; retried on the
+            # next reconnect.
+            device_id = None
+            if self.get_device_id:
+                try:
+                    device_id = await self.get_device_id()
+                except Exception as e:
+                    _LOGGER.debug("Default speaker lookup failed: %s", e)
 
             # Register as a Home Assistant client
             await self._websocket.send_json(
@@ -114,7 +122,7 @@ class JukeboxWebSocket:
                         "client_type": "home_assistant",
                         "client_name": "Home Assistant",
                         "capabilities": ["websocket_status"],
-                        "device_id": "living_room",
+                        "device_id": device_id,
                         "client_id": self.client_id
                     },
                 }

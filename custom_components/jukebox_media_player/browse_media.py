@@ -25,14 +25,12 @@ class JukeboxBrowseMedia:
         api_client: JukeboxAPIClient,
         host: str,
         port: int,
-        use_ssl: bool,
         get_browse_image_url: Callable[[str, str, str | None], str] | None = None,
     ) -> None:
         """Initialize the browse media handler."""
         self.api_client = api_client
         self.host = host
         self.port = port
-        self.use_ssl = use_ssl
         self.get_browse_image_url = get_browse_image_url
 
     def _build_absolute_url(self, relative_url: str) -> str | None:
@@ -51,19 +49,11 @@ class JukeboxBrowseMedia:
         if not relative_url.startswith("/"):
             relative_url = f"/{relative_url}"
 
-        # Build absolute URL using the same base as API
-        protocol = "https" if self.use_ssl else "http"
-        if (protocol == "https" and self.port == 443) or (
-            protocol == "http" and self.port == 80
-        ):
-            _LOGGER.info(
-                f"Building absolute URL: {protocol}://{self.host}{relative_url}"
-            )
-            return f"{protocol}://{self.host}{relative_url}"
-        _LOGGER.info(
-            f"Building absolute URL: {protocol}://{self.host}:{self.port}{relative_url}"
-        )
-        return f"{protocol}://{self.host}:{self.port}{relative_url}"
+        # Build absolute URL using the same base as API (plain HTTP; port
+        # omitted when 80)
+        if self.port == 80:
+            return f"http://{self.host}{relative_url}"
+        return f"http://{self.host}:{self.port}{relative_url}"
 
     async def build_root(self) -> BrowseMedia:
         """Browse root level - show letter groups."""
@@ -222,13 +212,10 @@ class JukeboxBrowseMedia:
                         MediaType.ALBUM, f"album:{target_album_id}", target_album_id
                     )
                 else:
-                    protocol = "https" if self.use_ssl else "http"
-                    if (protocol == "https" and self.port == 443) or (
-                        protocol == "http" and self.port == 80
-                    ):
-                        album_art_url = f"{protocol}://{self.host}/api/subsonic/cover/{target_album_id}"
+                    if self.port == 80:
+                        album_art_url = f"http://{self.host}/api/subsonic/cover/{target_album_id}"
                     else:
-                        album_art_url = f"{protocol}://{self.host}:{self.port}/api/subsonic/cover/{target_album_id}"
+                        album_art_url = f"http://{self.host}:{self.port}/api/subsonic/cover/{target_album_id}"
 
             if track_id and track_title:
                 # Format: track:{album_id}:{track_index}
