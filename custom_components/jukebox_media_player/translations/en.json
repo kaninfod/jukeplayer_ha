@@ -12,13 +12,11 @@
             "user": {
                 "data": {
                     "host": "Host",
-                    "password": "Password",
-                    "username": "Username"
+                    "port": "Port"
                 },
                 "data_description": {
                     "host": "The hostname or IP address of your Jukebox server.",
-                    "password": "Password for authentication.",
-                    "username": "Username for authentication."
+                    "port": "The backend's HTTP port (default 8000; omit from URLs when 80)."
                 }
             }
         }

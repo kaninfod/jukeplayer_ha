@@ -29,7 +29,6 @@ from .websocket_handler import JukeboxWebSocket
 _LOGGER = logging.getLogger(__name__)
 
 # Configuration constants
-CONF_USE_SSL = "use_ssl"
 CONF_PORT = "port"
 
 
@@ -40,19 +39,13 @@ async def async_setup_entry(
 ) -> None:
     """Set up Jukebox media player from a config entry."""
     host = entry.data[CONF_HOST]
-    username = entry.data[CONF_USERNAME]
-    password = entry.data[CONF_PASSWORD]
-    use_ssl = entry.data.get(CONF_USE_SSL, True)
-    port = entry.data.get(CONF_PORT, 443 if use_ssl else 80)
+    port = entry.data.get(CONF_PORT, 8000)
 
     # Create the media player entity
     entity = JukeboxMediaPlayer(
         entry=entry,
         host=host,
         port=port,
-        username=username,
-        password=password,
-        use_ssl=use_ssl,
     )
     async_add_entities([entity], update_before_add=True)
 
@@ -65,15 +58,15 @@ class JukeboxMediaPlayer(MediaPlayerEntity):
         entry: ConfigEntry,
         host: str,
         port: int,
-        username: str,
-        password: str,
-        use_ssl: bool,
     ) -> None:
-        """Initialize the Jukebox Media Player."""
+        """Initialize the Jukebox Media Player.
+
+        The backend is LAN-only plain HTTP by design — no TLS support; the
+        port is omitted from URLs when it is the scheme default (80).
+        """
         self._entry = entry
         self._host = host
         self._port = port
-        self._use_ssl = use_ssl
         self._attr_name = f"Jukebox {host}"
         self._attr_state = MediaPlayerState.IDLE
         self._track_info = {}
@@ -91,39 +84,25 @@ class JukeboxMediaPlayer(MediaPlayerEntity):
         # Repeat mode
         self._attr_repeat = RepeatMode.OFF
 
-        # Prepare basic auth headers for NPM
-        auth_headers = {}
-        if username and password:
-            credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
-            auth_headers["Authorization"] = f"Basic {credentials}"
-            _LOGGER.debug("Using basic authentication (NPM will inject API key)")
+        # Build WebSocket URL (http/ws; port omitted when 80)
+        if port == 80:
+            ws_url = "ws://{host}/ws/mediaplayer/events?detail=full&client_name=homeassistant".format(host=host)
         else:
-            _LOGGER.error("Username and password are required for NPM basic auth")
-
-        # Build WebSocket URL
-        protocol = "https" if use_ssl else "http"
-        ws_protocol = "wss" if use_ssl else "ws"
-        if (protocol == "https" and port == 443) or (protocol == "http" and port == 80):
-            ws_url = f"{ws_protocol}://{host}/ws/mediaplayer/status"
-        else:
-            ws_url = f"{ws_protocol}://{host}:{port}/ws/mediaplayer/status"
+            ws_url = f"ws://{host}:{port}/ws/mediaplayer/events?detail=full&client_name=homeassistant"
 
         # Initialize helper modules
         self._api_client = JukeboxAPIClient(
             hass=None,  # Will be set in async_added_to_hass
             host=host,
             port=port,
-            use_ssl=use_ssl,
-            auth_headers=auth_headers,
         )
         self._ws_url = ws_url
-        self._auth_headers = auth_headers
 
         self._browse_media_helper = JukeboxBrowseMedia(
             api_client=self._api_client,
             host=host,
             port=port,
-            use_ssl=use_ssl,
+            get_browse_image_url=self.get_browse_image_url,
         )
 
         self._websocket_handler: JukeboxWebSocket | None = None
@@ -188,15 +167,17 @@ class JukeboxMediaPlayer(MediaPlayerEntity):
 
     @property
     def media_image_url(self) -> str | None:
-        """Image URL of current playing media."""
-        # Try the new absolute thumb URL first
-        thumb_abs = self._track_info.get("thumb_abs")
-        if thumb_abs:
-            # thumb_abs should already be a complete URL, return as-is
-            _LOGGER.debug("Using thumb_abs: %s", thumb_abs)
-            return thumb_abs
-
-        _LOGGER.debug("No thumb image found in track info")
+        """Image URL of current playing media (from cover_url in track info, always absolute)."""
+        cover_url = self._track_info.get("cover_url")
+        if cover_url:
+            # If already absolute, return as-is
+            if cover_url.startswith("http://") or cover_url.startswith("https://"):
+                return cover_url
+            # Otherwise, prepend protocol, host, and port (port omitted when 80)
+            if self._port == 80:
+                return f"http://{self._host}{cover_url}?size=512"
+            return f"http://{self._host}:{self._port}{cover_url}?size=512"
+        _LOGGER.debug("No cover_url found in track info")
         return None
 
     @property
@@ -298,9 +279,8 @@ class JukeboxMediaPlayer(MediaPlayerEntity):
         self._websocket_handler = JukeboxWebSocket(
             hass=self.hass,
             ws_url=self._ws_url,
-            auth_headers=self._auth_headers,
-            use_ssl=self._port == 443 or self._use_ssl,
             data_callback=self._handle_websocket_message,
+            get_device_id=self._api_client.get_default_speaker,
         )
         await self._websocket_handler.start()
 
@@ -319,7 +299,9 @@ class JukeboxMediaPlayer(MediaPlayerEntity):
 
         # Prevent API calls if hass is not set yet
         if self._api_client.hass is None:
-            _LOGGER.debug("Skipping async_update: HomeAssistant instance not set on API client")
+            _LOGGER.debug(
+                "Skipping async_update: HomeAssistant instance not set on API client"
+            )
             return
 
         # Fallback to polling if websocket isn't working
@@ -398,6 +380,9 @@ class JukeboxMediaPlayer(MediaPlayerEntity):
             if "muted" in data:
                 self._attr_is_volume_muted = bool(data["muted"])
 
+            if "name" in data:
+                self._attr_source = data["name"]
+
             # Schedule entity update
             if self.hass and self.entity_id:
                 self.async_schedule_update_ha_state()
@@ -416,55 +401,67 @@ class JukeboxMediaPlayer(MediaPlayerEntity):
 
     async def async_media_play(self) -> None:
         """Send play command."""
-        await self._api_client.play()
+        success = await self._websocket_handler.send_message("play_pause", {})
+        if success:
+            self.async_schedule_update_ha_state()
 
     async def async_media_pause(self) -> None:
         """Send pause command."""
-        await self._api_client.pause()
+        success = await self._websocket_handler.send_message("play_pause", {})
+        if success:
+            self.async_schedule_update_ha_state()
+
 
     async def async_media_stop(self) -> None:
         """Send stop command."""
-        await self._api_client.stop()
+        success = await self._websocket_handler.send_message("stop", {})
+
 
     async def async_media_next_track(self) -> None:
         """Send next track command."""
-        await self._api_client.next_track()
+        success = await self._websocket_handler.send_message("next_track", {})
 
     async def async_media_previous_track(self) -> None:
         """Send previous track command."""
-        await self._api_client.previous_track()
+        success = await self._websocket_handler.send_message("previous_track", {})
 
     async def async_volume_up(self) -> None:
         """Volume up the media player."""
-        await self._api_client.volume_up()
+        success = await self._websocket_handler.send_message("volume_up", {})
 
     async def async_volume_down(self) -> None:
         """Volume down the media player."""
-        await self._api_client.volume_down()
+        success = await self._websocket_handler.send_message("volume_down", {})
 
     async def async_select_source(self, source: str) -> None:
         """Select playback source (output device)."""
+
+        # client_id = None
+        # if self._websocket_handler and self._websocket_handler.is_connected:
+        #     client_id = self._websocket_handler.client_id
+
+        # if not client_id:
+        #     _LOGGER.error("Cannot switch source: WebSocket is not registered or client_id is missing")
+        #     return
+
         # Find backend for the selected device
         devices = await self._api_client.get_output_devices()
-        backend = None
+        new_device = ""
         for device in devices:
             if device.get("name") == source:
-                backend = device.get("backend")
+                new_device = device.get("device")
                 break
-        if not backend:
-            _LOGGER.error("Could not find backend for source: %s", source)
-            return
-        success = await self._api_client.switch_output_device(backend, source)
+        success = await self._websocket_handler.send_message(
+            "switch_device", {"device_id": new_device}
+        )
         if success:
-            _LOGGER.debug(
-                "Successfully switched to source: %s (backend: %s)", source, backend
-            )
+            _LOGGER.debug("Successfully switched to source: %s", source)
             self._attr_source = source
             self.async_schedule_update_ha_state()
             await self._update_sources()
         else:
             _LOGGER.error(
-                "Failed to switch to source: %s (backend: %s)", source, backend
+                "Failed to switch to source: %s (backend: %s)", source, "backend"
             )
 
     async def _update_sources(self) -> None:
@@ -476,10 +473,10 @@ class JukeboxMediaPlayer(MediaPlayerEntity):
         ]
 
         # Get active device from output status
-        status = await self._api_client.get_output_status()
-        active_device = status.get("active_device")
-        if active_device:
-            self._attr_source = active_device
+        # status = await self._api_client.get_output_status()
+        # active_device = status.get("active_device")
+        # if active_device:
+        #     self._attr_source = active_device
 
     async def async_play_media(
         self,
@@ -489,19 +486,15 @@ class JukeboxMediaPlayer(MediaPlayerEntity):
     ) -> None:
         """Play media from browse media."""
         _LOGGER.debug("Play media called: type=%s, id=%s", media_type, media_id)
-
-        # Parse the media_id to determine what to play
-        # Format: "album:{album_id}" or "track:{album_id}:{track_index}"
         if media_id.startswith("album:"):
             album_id = media_id.split(":", 1)[1]
-            await self._api_client.play_album(album_id)
+            success = await self._websocket_handler.send_message("play_album", { "album_id": album_id, "start_track_index": 0 })
         elif media_id.startswith("track:"):
-            # Format: "track:{album_id}:{track_index}"
             parts = media_id.split(":", 2)
             if len(parts) == 3:
                 album_id = parts[1]
                 track_index = int(parts[2])
-                await self._api_client.play_album(album_id, track_index)
+                success = await self._websocket_handler.send_message("play_album", { "album_id": album_id, "start_track_index": track_index })
             else:
                 _LOGGER.error("Invalid track media_id format: %s", media_id)
         else:
@@ -509,8 +502,7 @@ class JukeboxMediaPlayer(MediaPlayerEntity):
 
     async def async_set_volume_level(self, volume: float) -> None:
         """Set volume level, range 0..1."""
-        success = await self._api_client.set_volume(volume)
-
+        success = await self._websocket_handler.send_message("volume", { "value": volume*100 })
         if success:
             # Update local volume level immediately for responsive UI
             self._attr_volume_level = volume
@@ -560,6 +552,23 @@ class JukeboxMediaPlayer(MediaPlayerEntity):
             self.async_schedule_update_ha_state()
         else:
             _LOGGER.error("Failed to toggle mute")
+
+    async def async_get_browse_image(
+        self,
+        media_content_type: str,
+        media_content_id: str,
+        media_image_id: str | None = None,
+    ) -> tuple[bytes | None, str | None]:
+        """Fetch image for media browser."""
+        if not media_image_id:
+            return None, None
+
+        if self._port == 80:
+            url = f"http://{self._host}/api/subsonic/cover/{media_image_id}"
+        else:
+            url = f"http://{self._host}:{self._port}/api/subsonic/cover/{media_image_id}"
+
+        return await self._async_fetch_image_from_cache(url)
 
     async def async_browse_media(
         self,

@@ -4,13 +4,11 @@
       "user": {
         "data": {
           "host": "[%key:common::config_flow::data::host%]",
-          "username": "[%key:common::config_flow::data::username%]",
-          "password": "[%key:common::config_flow::data::password%]"
+          "port": "Port"
         },
         "data_description": {
           "host": "The hostname or IP address of your Jukebox server.",
-          "username": "Username for authentication.",
-          "password": "Password for authentication."
+          "port": "The backend's HTTP port (default 8000; omit from URLs when 80)."
         }
       }
     },

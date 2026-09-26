@@ -6,12 +6,9 @@
   ],
   "config_flow": true,
   "dependencies": [],
-  "documentation": "https://www.home-assistant.io/integrations/jukebox_media_player",
-  "homekit": {},
-  "version": "0.1.0",
+  "documentation": "https://github.com/kaninfod/jukeplayer_ha",
   "iot_class": "local_push",
   "quality_scale": "bronze",
   "requirements": [],
-  "ssdp": [],
-  "zeroconf": []
+  "version": "0.2.0"
 }

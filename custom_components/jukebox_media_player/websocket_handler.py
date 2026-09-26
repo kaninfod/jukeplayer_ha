@@ -1,4 +1,4 @@
-"""WebSocket handler for Jukebox media player."""
+"""WebSocket handler for the Jukeplayer media player."""
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ import asyncio
 from collections.abc import Callable, Coroutine
 import json
 import logging
-import ssl
 from typing import Any
 
 import aiohttp
@@ -24,16 +23,21 @@ class JukeboxWebSocket:
         self,
         hass: HomeAssistant,
         ws_url: str,
-        auth_headers: dict[str, str],
-        use_ssl: bool,
         data_callback: Callable[[dict[str, Any]], Coroutine[Any, Any, None]],
+        get_device_id: Callable[[], Coroutine[Any, Any, str | None]] | None = None,
     ) -> None:
-        """Initialize the WebSocket handler."""
+        """Initialize the WebSocket handler.
+
+        get_device_id (optional) is awaited before every (re)connect so the
+        register payload carries the backend's current default speaker — that
+        is what lands the client on a speaker and keeps current_track
+        broadcasts flowing. No hardcoded speaker name.
+        """
         self.hass = hass
         self.ws_url = ws_url
-        self.auth_headers = auth_headers
-        self.use_ssl = use_ssl
         self.data_callback = data_callback
+        self.get_device_id = get_device_id
+        self.client_id: str | None = None
 
         self._websocket: aiohttp.ClientWebSocketResponse | None = None
         self._task: asyncio.Task | None = None
@@ -89,24 +93,40 @@ class JukeboxWebSocket:
         """Connect to the websocket and handle messages."""
         session = async_get_clientsession(self.hass)
 
-        # Configure SSL context for WSS
-        ssl_context = False
-        if self.use_ssl:
-            ssl_context = await self.hass.async_add_executor_job(
-                ssl.create_default_context
-            )
-
         _LOGGER.debug("Connecting to websocket: %s", self.ws_url)
 
         try:
-            # Try connecting with basic auth headers first
+            # Try connecting
             self._websocket = await session.ws_connect(
                 self.ws_url,
-                headers=self.auth_headers,
-                ssl=ssl_context,
             )
 
             _LOGGER.warning("🔗 WEBSOCKET CONNECTED to jukebox successfully!")
+
+            # Resolve the default speaker so the registration lands the
+            # client on a speaker (current_track broadcasts ride that
+            # assignment). None → backend default fallback; retried on the
+            # next reconnect.
+            device_id = None
+            if self.get_device_id:
+                try:
+                    device_id = await self.get_device_id()
+                except Exception as e:
+                    _LOGGER.debug("Default speaker lookup failed: %s", e)
+
+            # Register as a Home Assistant client
+            await self._websocket.send_json(
+                {
+                    "type": "register_client",
+                    "payload": {
+                        "client_type": "home_assistant",
+                        "client_name": "Home Assistant",
+                        "capabilities": ["websocket_status"],
+                        "device_id": device_id,
+                        "client_id": self.client_id
+                    },
+                }
+            )
 
             # Listen for messages
             async for msg in self._websocket:
@@ -124,11 +144,11 @@ class JukeboxWebSocket:
                     break
 
         except aiohttp.ClientResponseError as e:
-            if e.status == 401:
+            if e.status in (401, 403):
                 _LOGGER.error(
-                    "Websocket authentication failed - check NPM basic auth credentials"
+                    "Websocket connection failed with HTTP %s: Access forbidden or unauthorized",
+                    e.status,
                 )
-                await self._try_fallback_connection(session, ssl_context)
             else:
                 _LOGGER.error("Websocket HTTP error %s: %s", e.status, e)
         except asyncio.CancelledError:
@@ -142,34 +162,6 @@ class JukeboxWebSocket:
             if self._websocket and not self._websocket.closed:
                 await self._websocket.close()
             self._websocket = None
-
-    async def _try_fallback_connection(
-        self, session: aiohttp.ClientSession, ssl_context: ssl.SSLContext | bool
-    ) -> None:
-        """Try connecting without auth headers as fallback."""
-        try:
-            _LOGGER.debug("Trying websocket connection without auth headers")
-            self._websocket = await session.ws_connect(self.ws_url, ssl=ssl_context)
-            _LOGGER.info("Websocket connected without auth")
-
-            # Continue with message processing
-            async for msg in self._websocket:
-                if msg.type == aiohttp.WSMsgType.TEXT:
-                    await self._handle_text_message(msg.data)
-                elif msg.type in (
-                    aiohttp.WSMsgType.PING,
-                    aiohttp.WSMsgType.PONG,
-                ):
-                    continue
-                elif msg.type == aiohttp.WSMsgType.ERROR:
-                    _LOGGER.error("Websocket error: %s", self._websocket.exception())
-                    break
-                elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED):
-                    _LOGGER.info("Websocket closed")
-                    break
-
-        except Exception as fallback_e:
-            _LOGGER.error("Websocket fallback connection also failed: %s", fallback_e)
 
     async def _handle_text_message(self, message_data: str) -> None:
         """Handle incoming text message from websocket."""
@@ -194,6 +186,18 @@ class JukeboxWebSocket:
                     _LOGGER.error("Error processing websocket data: %s", update_error)
             elif msg_type == "ping":
                 _LOGGER.debug("Received server ping, ignoring")
+            elif msg_type == "register_response":
+                status = payload.get("status")
+                self.client_id = payload.get("client_id")
+                if status == "success":
+                    _LOGGER.info(
+                        "Registered with Jukebox backend as client %s", self.client_id
+                    )
+                else:
+                    _LOGGER.error(
+                        "Registration with Jukebox backend failed: %s",
+                        payload.get("message"),
+                    )
             else:
                 _LOGGER.debug("Ignoring websocket message type: %s", msg_type)
 
@@ -261,3 +265,21 @@ class JukeboxWebSocket:
 
         _LOGGER.debug("✅ VALIDATION PASSED")
         return True
+
+    async def send_message(self, message_type: str, payload: dict[str, Any]) -> bool:
+            """Send a message over the WebSocket connection if it is active."""
+            if not self.is_connected or self._websocket is None:
+                _LOGGER.error("Cannot send message: WebSocket is disconnected")
+                return False
+
+            try:
+                message = {
+                    "type": message_type,
+                    "payload": payload
+                }
+                _LOGGER.debug("Sending WebSocket message: %s", message)
+                await self._websocket.send_json(message)
+                return True
+            except Exception as e:
+                _LOGGER.error("Failed to send WebSocket message: %s", e)
+                return False
