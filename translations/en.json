@@ -11,14 +11,10 @@
         "step": {
             "user": {
                 "data": {
-                    "host": "Host",
-                    "password": "Password",
-                    "username": "Username"
+                    "host": "Host"
                 },
                 "data_description": {
-                    "host": "The hostname or IP address of your Jukebox server.",
-                    "password": "Password for authentication.",
-                    "username": "Username for authentication."
+                    "host": "The hostname or IP address of your Jukebox server."
                 }
             }
         }

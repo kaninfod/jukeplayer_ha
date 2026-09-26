@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from homeassistant.components.media_player import (
     BrowseMedia,
@@ -26,27 +26,43 @@ class JukeboxBrowseMedia:
         host: str,
         port: int,
         use_ssl: bool,
+        get_browse_image_url: Callable[[str, str, str | None], str] | None = None,
     ) -> None:
         """Initialize the browse media handler."""
         self.api_client = api_client
         self.host = host
         self.port = port
         self.use_ssl = use_ssl
+        self.get_browse_image_url = get_browse_image_url
 
     def _build_absolute_url(self, relative_url: str) -> str | None:
         """Build absolute URL from relative path."""
         if not relative_url:
             return None
 
+        # If the backend is returning an absolute URL using an old PUBLIC_BASE_URL,
+        # we extract just the path so we can force it over the current HA connection IP/port
+        from urllib.parse import urlparse
+
         if relative_url.startswith("http"):
-            return relative_url
+            parsed = urlparse(relative_url)
+            relative_url = parsed.path
+
+        if not relative_url.startswith("/"):
+            relative_url = f"/{relative_url}"
 
         # Build absolute URL using the same base as API
         protocol = "https" if self.use_ssl else "http"
         if (protocol == "https" and self.port == 443) or (
             protocol == "http" and self.port == 80
         ):
+            _LOGGER.info(
+                f"Building absolute URL: {protocol}://{self.host}{relative_url}"
+            )
             return f"{protocol}://{self.host}{relative_url}"
+        _LOGGER.info(
+            f"Building absolute URL: {protocol}://{self.host}:{self.port}{relative_url}"
+        )
         return f"{protocol}://{self.host}:{self.port}{relative_url}"
 
     async def build_root(self) -> BrowseMedia:
@@ -144,8 +160,11 @@ class JukeboxBrowseMedia:
             album_year = album.get("year")
             cover_url = album.get("cover_url")
 
-            # Build absolute URL for cover if available
-            thumbnail = self._build_absolute_url(cover_url) if cover_url else None
+            # Use cover_url from album JSON, always make absolute
+            if cover_url:
+                thumbnail = self._build_absolute_url(cover_url)
+            else:
+                thumbnail = None
 
             if album_id and album_name:
                 title = f"{album_name} ({album_year})" if album_year else album_name
@@ -196,14 +215,20 @@ class JukeboxBrowseMedia:
                 album_name = track.get("album")
 
             # Build cover art URL if available
-            if not album_art_url and cover_art:
-                protocol = "https" if self.use_ssl else "http"
-                if (protocol == "https" and self.port == 443) or (
-                    protocol == "http" and self.port == 80
-                ):
-                    album_art_url = f"{protocol}://{self.host}/assets/covers/{cover_art}/cover-180.webp"
+            if not album_art_url and (album_id_from_track or album_id):
+                target_album_id = album_id_from_track or album_id
+                if self.get_browse_image_url:
+                    album_art_url = self.get_browse_image_url(
+                        MediaType.ALBUM, f"album:{target_album_id}", target_album_id
+                    )
                 else:
-                    album_art_url = f"{protocol}://{self.host}:{self.port}/assets/covers/{cover_art}/cover-180.webp"
+                    protocol = "https" if self.use_ssl else "http"
+                    if (protocol == "https" and self.port == 443) or (
+                        protocol == "http" and self.port == 80
+                    ):
+                        album_art_url = f"{protocol}://{self.host}/api/subsonic/cover/{target_album_id}"
+                    else:
+                        album_art_url = f"{protocol}://{self.host}:{self.port}/api/subsonic/cover/{target_album_id}"
 
             if track_id and track_title:
                 # Format: track:{album_id}:{track_index}
