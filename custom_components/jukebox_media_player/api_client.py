@@ -89,16 +89,31 @@ class JukeboxAPIClient:
 
     async def get_default_speaker(self) -> str | None:
         """The backend's default speaker — used to register the WS client so
-        it lands on a speaker and receives current_track broadcasts."""
+        it lands on a speaker and receives current_track broadcasts.
+
+        Reads it from /api/output/speakers (default_speaker field, backend
+        api-v2 and later); falls back to the legacy /api/output/options for
+        older backends."""
         try:
             result = await self.make_request(
+                "output/speakers", method="GET", return_json=True
+            )
+        except Exception as e:
+            _LOGGER.debug("Could not fetch speakers for default lookup: %s", e)
+            return None
+        if isinstance(result, dict) and result.get("default_speaker"):
+            return result["default_speaker"]
+
+        # legacy backend: /options still carried the default
+        try:
+            legacy = await self.make_request(
                 "output/options", method="GET", return_json=True
             )
         except Exception as e:
             _LOGGER.debug("Could not fetch default speaker: %s", e)
             return None
-        if isinstance(result, dict):
-            return (result.get("defaults") or {}).get("speaker")
+        if isinstance(legacy, dict):
+            return (legacy.get("defaults") or {}).get("speaker")
         return None
 
     async def get_status(self) -> dict[str, Any]:
@@ -195,15 +210,6 @@ class JukeboxAPIClient:
         if isinstance(result, list):
             return result
         return []
-
-    async def get_output_status(self) -> dict[str, Any]:
-        """Get output status including active backend/device and backend status."""
-        result = await self.make_request(
-            "output/status", method="GET", return_json=True
-        )
-        if isinstance(result, dict):
-            return result
-        return {}
 
     async def get_output_devices(self) -> list[dict[str, Any]]:
         """Get all available output devices from /api/output/speakers."""
